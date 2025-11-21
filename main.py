@@ -54,9 +54,11 @@ def preprocess_image(image_path):
         'enhanced_bgr': enhanced_bgr
     }
 
-def filter_paper_disks(white_mask, min_area=300, max_area=5000, circularity_threshold=0.7, min_diameter=56):
+def filter_paper_disks(white_mask, min_area=2000, max_area=8000, 
+                      circularity_threshold=0.8, min_diameter=70, max_diameter=110,
+                      max_count=4):  # 强制最多4个
     """
-    筛选真正的滤纸片，排除培养皿边缘等干扰
+    筛选真正的滤纸片 - 带数量限制的版本
     """
     contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
@@ -64,46 +66,36 @@ def filter_paper_disks(white_mask, min_area=300, max_area=5000, circularity_thre
     
     for contour in contours:
         area = cv2.contourArea(contour)
-        
-        # 面积筛选
-        if area < min_area or area > max_area:
-            continue
-            
-        # 圆形度筛选
         perimeter = cv2.arcLength(contour, True)
         if perimeter == 0:
             continue
             
         circularity = 4 * np.pi * area / (perimeter * perimeter)
-        if circularity < circularity_threshold:
-            continue
-        
-        # 计算最小外接圆
         (x, y), radius = cv2.minEnclosingCircle(contour)
-        center = (int(x), int(y))
-        radius = int(radius)
         diameter = 2 * radius
         
-        # 直径筛选：滤纸片直径大于30像素
-        if diameter < min_diameter:
-            continue
+        # 基础筛选
+        if (min_area <= area <= max_area and 
+            circularity >= circularity_threshold and 
+            min_diameter <= diameter <= max_diameter):
             
-        paper_disks.append({
-            'contour': contour,
-            'center': center,
-            'radius': radius,
-            'diameter': diameter,
-            'area': area,
-            'circularity': circularity
-        })
+            paper_disks.append({
+                'contour': contour,
+                'center': (int(x), int(y)),
+                'radius': int(radius),
+                'diameter': diameter,
+                'area': area,
+                'circularity': circularity
+            })
     
-    # 按面积排序
+    # 按面积排序并强制限制数量
     paper_disks.sort(key=lambda x: x['area'], reverse=True)
     
-    print(f"找到 {len(paper_disks)} 个可能的滤纸片 (直径 > {min_diameter}像素)")
-    for i, disk in enumerate(paper_disks):
-        print(f"滤纸片 {i+1}: 中心{disk['center']}, 半径{disk['radius']}px, 直径{disk['diameter']}px, 面积{disk['area']:.1f}, 圆形度{disk['circularity']:.3f}")
+    if len(paper_disks) > max_count:
+        print(f"找到 {len(paper_disks)} 个候选，强制保留前 {max_count} 个最大的")
+        paper_disks = paper_disks[:max_count]
     
+    print(f"最终滤纸片数量: {len(paper_disks)}")
     return paper_disks
 
 def region_segmentation(processed_data):
@@ -755,7 +747,7 @@ def display_final_result_only(processed_data, segmented_data):
         first_four_zones = segmented_data['inhibition_zones'][:4]
         valid_zones = [z for z in first_four_zones if z['inhibition_info']['valid']]
         
-        print(f"\n=== 抑菌圈检测最终结果 (前四个滤纸片) ===")
+        print(f"\n=== 抑菌圈检测最终结果===")
         print(f"检测到 {len(valid_zones)} 个有效的抑菌圈")
         
         for i, zone in enumerate(first_four_zones):
