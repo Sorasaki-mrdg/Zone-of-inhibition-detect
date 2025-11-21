@@ -2,6 +2,8 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
+import os
+import argparse
 
 def setup_chinese_font():
     """
@@ -52,7 +54,7 @@ def preprocess_image(image_path):
         'enhanced_bgr': enhanced_bgr
     }
 
-def filter_paper_disks(white_mask, min_area=100, max_area=5000, circularity_threshold=0.7, min_diameter=30):
+def filter_paper_disks(white_mask, min_area=300, max_area=5000, circularity_threshold=0.7, min_diameter=56):
     """
     筛选真正的滤纸片，排除培养皿边缘等干扰
     """
@@ -106,30 +108,146 @@ def filter_paper_disks(white_mask, min_area=100, max_area=5000, circularity_thre
 
 def region_segmentation(processed_data):
     """
-    区域分割函数
+    区域分割函数 - 新策略：宽范围捕捉 + 透明度过滤
     """
     enhanced_bgr = processed_data['enhanced_bgr']
     enhanced_rgb = processed_data['enhanced']
     hsv_image = processed_data['hsv']
+    lab_image = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2LAB)
     
-    print("基于提供的典型HSV值进行区域分割...")
+    print("新策略：宽范围捕捉所有黄色区域，再过滤透明区域...")
     
-    # 1. 黄色大肠杆菌区域分割
-    lower_e_coli = np.array([20, 30, 140])
-    upper_e_coli = np.array([35, 60, 180])
+    # 第一阶段：宽范围捕捉所有黄色区域（基于你反馈的range345）
+    print("第一阶段：宽范围黄色区域捕捉")
     
-    e_coli_mask = cv2.inRange(hsv_image, lower_e_coli, upper_e_coli)
+    # Range 3：宽范围黄色
+    lower_yellow_wide = np.array([10, 20, 100])
+    upper_yellow_wide = np.array([50, 100, 220])
+    mask_yellow_wide = cv2.inRange(hsv_image, lower_yellow_wide, upper_yellow_wide)
     
-    # 形态学操作优化大肠杆菌区域
+    # Range 4：中等范围黄色
+    lower_yellow_medium = np.array([18, 40, 150])
+    upper_yellow_medium = np.array([33, 70, 230])
+    mask_yellow_medium = cv2.inRange(hsv_image, lower_yellow_medium, upper_yellow_medium)
+    
+    # Range 5：较严格黄色
+    lower_yellow_strict = np.array([20, 45, 160])
+    upper_yellow_strict = np.array([32, 65, 210])
+    mask_yellow_strict = cv2.inRange(hsv_image, lower_yellow_strict, upper_yellow_strict)
+    
+    # 合并所有黄色区域
+    all_yellow_mask = cv2.bitwise_or(mask_yellow_wide, mask_yellow_medium)
+    all_yellow_mask = cv2.bitwise_or(all_yellow_mask, mask_yellow_strict)
+    
+    # 形态学操作填充小孔洞
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    all_yellow_mask = cv2.morphologyEx(all_yellow_mask, cv2.MORPH_CLOSE, kernel)
+    
+    print(f"宽范围黄色区域统计:")
+    print(f"  Range3: {np.count_nonzero(mask_yellow_wide)} 像素")
+    print(f"  Range4: {np.count_nonzero(mask_yellow_medium)} 像素")
+    print(f"  Range5: {np.count_nonzero(mask_yellow_strict)} 像素")
+    print(f"  合并后: {np.count_nonzero(all_yellow_mask)} 像素")
+    
+    # 第二阶段：过滤掉透明区域（抑菌圈）
+    print("第二阶段：过滤透明区域")
+    
+    # 方法1：基于亮度阈值 - 抑菌圈通常较暗
+    gray_image = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # 在黄色区域内计算亮度特征
+    yellow_region_brightness = cv2.bitwise_and(gray_image, gray_image, mask=all_yellow_mask)
+    
+    # 计算黄色区域的亮度统计
+    yellow_pixels = yellow_region_brightness[all_yellow_mask > 0]
+    if len(yellow_pixels) > 0:
+        brightness_median = np.median(yellow_pixels)
+        brightness_std = np.std(yellow_pixels)
+        brightness_threshold = brightness_median - 0.5 * brightness_std
+        
+        print(f"黄色区域亮度统计: 中位数={brightness_median:.1f}, 标准差={brightness_std:.1f}")
+        print(f"亮度阈值: {brightness_threshold:.1f}")
+        
+        # 创建亮度掩码 - 保留较亮的区域（大肠杆菌），过滤较暗的区域（抑菌圈）
+        brightness_mask = np.zeros_like(gray_image)
+        brightness_mask[gray_image > brightness_threshold] = 255
+        
+        # 结合黄色区域和亮度掩码
+        e_coli_mask = cv2.bitwise_and(all_yellow_mask, brightness_mask)
+    else:
+        e_coli_mask = all_yellow_mask
+        print("警告：未找到黄色区域，使用原始掩码")
+    
+    # 方法2：基于Lab颜色空间的亮度通道
+    lab_L = lab_image[:,:,0]  # 亮度通道
+    lab_L_yellow = cv2.bitwise_and(lab_L, lab_L, mask=all_yellow_mask)
+    lab_pixels = lab_L_yellow[all_yellow_mask > 0]
+    
+    if len(lab_pixels) > 0:
+        lab_median = np.median(lab_pixels)
+        lab_std = np.std(lab_pixels)
+        lab_threshold = lab_median - 0.3 * lab_std
+        
+        lab_brightness_mask = np.zeros_like(lab_L)
+        lab_brightness_mask[lab_L > lab_threshold] = 255
+        
+        # 与HSV方法的结果合并
+        e_coli_mask_lab = cv2.bitwise_and(all_yellow_mask, lab_brightness_mask)
+        e_coli_mask = cv2.bitwise_or(e_coli_mask, e_coli_mask_lab)
+    
+    # 最终形态学优化
     e_coli_mask = cv2.morphologyEx(e_coli_mask, cv2.MORPH_CLOSE, kernel)
     e_coli_mask = cv2.morphologyEx(e_coli_mask, cv2.MORPH_OPEN, kernel)
     
-    # 提取大肠杆菌区域
+    # 显示中间结果
+    plt.figure(figsize=(18, 4))
+    
+    plt.subplot(1, 6, 1)
+    plt.imshow(mask_yellow_wide, cmap='gray')
+    plt.title('Range3: Wide Yellow')
+    plt.axis('off')
+    
+    plt.subplot(1, 6, 2)
+    plt.imshow(mask_yellow_medium, cmap='gray')
+    plt.title('Range4: Medium Yellow')
+    plt.axis('off')
+    
+    plt.subplot(1, 6, 3)
+    plt.imshow(mask_yellow_strict, cmap='gray')
+    plt.title('Range5: Strict Yellow')
+    plt.axis('off')
+    
+    plt.subplot(1, 6, 4)
+    plt.imshow(all_yellow_mask, cmap='gray')
+    plt.title('All Yellow Regions')
+    plt.axis('off')
+    
+    plt.subplot(1, 6, 5)
+    plt.imshow(e_coli_mask, cmap='gray')
+    plt.title('After Transparency Filter')
+    plt.axis('off')
+    
+    # 显示被过滤掉的区域（抑菌圈）
+    filtered_out_mask = cv2.bitwise_xor(all_yellow_mask, e_coli_mask)
+    plt.subplot(1, 6, 6)
+    plt.imshow(filtered_out_mask, cmap='gray')
+    plt.title('Filtered Out (Inhibition)')
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"过滤后统计:")
+    print(f"  过滤前: {np.count_nonzero(all_yellow_mask)} 像素")
+    print(f"  过滤后: {np.count_nonzero(e_coli_mask)} 像素") 
+    print(f"  过滤掉: {np.count_nonzero(filtered_out_mask)} 像素 (抑菌圈区域)")
+    
+    # 提取最终的大肠杆菌区域
     e_coli_region = cv2.bitwise_and(enhanced_bgr, enhanced_bgr, mask=e_coli_mask)
     e_coli_region_rgb = cv2.cvtColor(e_coli_region, cv2.COLOR_BGR2RGB)
     
-    # 2. 白色区域分割 (滤纸片和可能的培养皿边缘)
+    # 白色区域分割（滤纸片）- 保持不变
+    print("进行白色区域分割...")
     lower_white_hsv = np.array([0, 0, 200])
     upper_white_hsv = np.array([180, 30, 255])
     white_mask_hsv = cv2.inRange(hsv_image, lower_white_hsv, upper_white_hsv)
@@ -139,13 +257,15 @@ def region_segmentation(processed_data):
     white_mask_rgb = cv2.inRange(enhanced_rgb, lower_white_rgb, upper_white_rgb)
     
     white_mask = cv2.bitwise_or(white_mask_hsv, white_mask_rgb)
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
     
-    # 筛选真正的滤纸片（直径大于30像素）
-    paper_disks = filter_paper_disks(white_mask, min_diameter=30)
+    kernel_white = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel_white)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel_white)
     
-    # 创建滤纸片专用掩码
+    # 筛选滤纸片
+    paper_disks = filter_paper_disks(white_mask, min_area=50, max_area=10000, 
+                                   circularity_threshold=0.4, min_diameter=15)
+    
     paper_mask = np.zeros_like(white_mask)
     for disk in paper_disks:
         cv2.drawContours(paper_mask, [disk['contour']], 0, 255, -1)
@@ -153,22 +273,26 @@ def region_segmentation(processed_data):
     white_region = cv2.bitwise_and(enhanced_bgr, enhanced_bgr, mask=paper_mask)
     white_region_rgb = cv2.cvtColor(white_region, cv2.COLOR_BGR2RGB)
     
-    # 3. 背景分割
+    # 背景分割
     combined_mask = cv2.bitwise_or(e_coli_mask, paper_mask)
     background_mask = cv2.bitwise_not(combined_mask)
     background_region = cv2.bitwise_and(enhanced_bgr, enhanced_bgr, mask=background_mask)
     background_region_rgb = cv2.cvtColor(background_region, cv2.COLOR_BGR2RGB)
     
-    # 4. 创建分割结果可视化
+    # 创建分割结果可视化
     segmentation_visual = np.zeros_like(enhanced_rgb)
     segmentation_visual[e_coli_mask > 0] = [255, 255, 0]    # 大肠杆菌 - 黄色
     segmentation_visual[paper_mask > 0] = [255, 255, 255]   # 滤纸片 - 白色
     segmentation_visual[background_mask > 0] = [128, 128, 128]  # 背景 - 灰色
     
+    print(f"区域分割完成:")
+    print(f"  大肠杆菌区域: {np.count_nonzero(e_coli_mask)} 像素")
+    print(f"  滤纸片数量: {len(paper_disks)} 个")
+    
     return {
         'e_coli_mask': e_coli_mask,
-        'white_mask': white_mask,  # 所有白色区域
-        'paper_mask': paper_mask,  # 筛选后的滤纸片
+        'white_mask': white_mask,
+        'paper_mask': paper_mask,
         'background_mask': background_mask,
         'e_coli_region': e_coli_region_rgb,
         'white_region': white_region_rgb,
@@ -176,7 +300,7 @@ def region_segmentation(processed_data):
         'segmentation_visual': segmentation_visual,
         'enhanced_bgr': enhanced_bgr,
         'enhanced_rgb': enhanced_rgb,
-        'paper_disks': paper_disks  # 滤纸片信息
+        'paper_disks': paper_disks
     }
 
 def detect_inhibition_zone_for_disk(disk, enhanced_bgr, e_coli_mask):
@@ -606,7 +730,7 @@ def detect_inhibition_zones(segmented_data):
 
 def display_final_result_only(processed_data, segmented_data):
     """
-    只显示最终检测结果
+    只显示最终检测结果 - 只输出前四个抑菌圈
     """
     plt.figure(figsize=(15, 10), dpi=100)
     
@@ -625,13 +749,16 @@ def display_final_result_only(processed_data, segmented_data):
     plt.tight_layout()
     plt.show()
     
-    # 在控制台输出简洁的检测结果
+    # 在控制台输出简洁的检测结果 - 只输出前四个
     if 'inhibition_zones' in segmented_data:
-        print(f"\n=== 抑菌圈检测最终结果 ===")
-        valid_zones = [z for z in segmented_data['inhibition_zones'] if z['inhibition_info']['valid']]
+        # 只取前四个滤纸片
+        first_four_zones = segmented_data['inhibition_zones'][:4]
+        valid_zones = [z for z in first_four_zones if z['inhibition_info']['valid']]
+        
+        print(f"\n=== 抑菌圈检测最终结果 (前四个滤纸片) ===")
         print(f"检测到 {len(valid_zones)} 个有效的抑菌圈")
         
-        for i, zone in enumerate(segmented_data['inhibition_zones']):
+        for i, zone in enumerate(first_four_zones):
             disk = zone['paper_disk']
             inhibition_info = zone['inhibition_info']
             
@@ -647,7 +774,7 @@ def display_final_result_only(processed_data, segmented_data):
 
 def display_detailed_results(processed_data, segmented_data):
     """
-    显示详细处理过程（原有的详细显示函数）
+    显示详细处理过程 - 只输出前四个抑菌圈
     """
     # 设置图形大小
     plt.figure(figsize=(20, 15), dpi=100)
@@ -701,13 +828,14 @@ def display_detailed_results(processed_data, segmented_data):
     edges = cv2.Canny(gray_image, 50, 150)
     plt.imshow(edges, cmap='gray')
     
-    # 标记边界点
+    # 标记边界点 - 只标记前四个
     if 'inhibition_zones' in segmented_data:
-        for zone in segmented_data['inhibition_zones']:
+        first_four_zones = segmented_data['inhibition_zones'][:4]
+        for zone in first_four_zones:
             points = zone['inhibition_info']['boundary_points']
             if len(points) > 0:
                 plt.scatter(points[:, 0], points[:, 1], c='red', s=10, alpha=0.6)
-    plt.title('9. Boundary Points on Edges')
+    plt.title('9. Boundary Points on Edges (First 4)')
     plt.axis('off')
     
     plt.subplot(3, 4, 10)
@@ -715,15 +843,16 @@ def display_detailed_results(processed_data, segmented_data):
     plt.title('10. Final Detection Result')
     plt.axis('off')
     
-    # 显示检测结果统计
+    # 显示检测结果统计 - 只显示前四个
     plt.subplot(3, 4, 11)
     plt.axis('off')
     
-    # 创建文本信息
+    # 创建文本信息 - 只显示前四个
     if 'inhibition_zones' in segmented_data:
-        info_text = "Detection Results:\n\n"
+        first_four_zones = segmented_data['inhibition_zones'][:4]
+        info_text = "Detection Results (First 4):\n\n"
         valid_count = 0
-        for i, zone in enumerate(segmented_data['inhibition_zones']):
+        for i, zone in enumerate(first_four_zones):
             disk = zone['paper_disk']
             inhibition_info = zone['inhibition_info']
             
@@ -735,11 +864,12 @@ def display_detailed_results(processed_data, segmented_data):
                 valid_count += 1
                 info_text += f"  Inhibition Radius: {inhibition_info['inhibition_radius']}px\n"
                 info_text += f"  Inhibition Diameter: {inhibition_info['inhibition_diameter']}px\n"
+                info_text += f"  Inhibition Diameter: {inhibition_info['inhibition_diameter_mm']:.2f}mm\n"
             else:
                 info_text += f"  No valid inhibition zone\n"
             info_text += "\n"
         
-        info_text += f"Total valid: {valid_count}/{len(segmented_data['inhibition_zones'])}"
+        info_text += f"Total valid: {valid_count}/4"
         
         plt.text(0.1, 0.9, info_text, transform=plt.gca().transAxes, 
                 fontsize=10, verticalalignment='top', fontfamily='monospace')
@@ -751,13 +881,15 @@ def display_detailed_results(processed_data, segmented_data):
     plt.tight_layout()
     plt.show()
     
-    # 控制台输出详细结果
+    # 控制台输出详细结果 - 只输出前四个
     if 'inhibition_zones' in segmented_data:
-        print(f"\n=== 抑菌圈检测结果汇总 ===")
-        valid_zones = [z for z in segmented_data['inhibition_zones'] if z['inhibition_info']['valid']]
+        first_four_zones = segmented_data['inhibition_zones'][:4]
+        valid_zones = [z for z in first_four_zones if z['inhibition_info']['valid']]
+        
+        print(f"\n=== 抑菌圈检测结果汇总 (前四个滤纸片) ===")
         print(f"找到 {len(valid_zones)} 个有效的抑菌圈")
         
-        for i, zone in enumerate(segmented_data['inhibition_zones']):
+        for i, zone in enumerate(first_four_zones):
             disk = zone['paper_disk']
             inhibition_info = zone['inhibition_info']
             
@@ -784,16 +916,31 @@ def main():
     感谢北の猫给我找了这么个好玩的项目
     """
     
-    print("此脚本针对sample_antibiotic.jpg图片进行抑菌圈检测")
-    print("请保证大肠杆菌的颜色没有太大变和光照条件相同")
-    print("图片路径在main函数中，确保路径正确")
+    print("抑菌圈自动检测系统")
+    print("请保证大肠杆菌的颜色没有太大变化和光照条件相同")
     
     # 设置中文字体
     setup_chinese_font()
     
-    image_path = ".\input\sample_antibiotic.jpg"  # 请确保图片路径正确
+    # 设置命令行参数解析
+    parser = argparse.ArgumentParser(description='抑菌圈自动检测系统')
+    parser.add_argument('-input', '--input', type=str, required=True, 
+                       help='输入图片路径')
+    parser.add_argument('-mode', '--mode', type=str, choices=['simple', 'detailed'], 
+                       default='simple', help='显示模式: simple(简单) 或 detailed(详细)')
+    
+    # 解析参数
+    args = parser.parse_args()
+    image_path = args.input
+    
+    # 检查文件是否存在
+    if not os.path.exists(image_path):
+        print(f"错误: 图片文件不存在: {image_path}")
+        return
+    
     
     try:
+        print(f"开始处理图片: {image_path}")
         print("Starting image preprocessing...")
         # 图像预处理
         processed_data = preprocess_image(image_path)
@@ -809,22 +956,23 @@ def main():
         segmented_data = detect_inhibition_zones(segmented_data)
         print("Inhibition zone detection completed!")
         
-        # 选择显示模式
-        print("\n选择显示模式:")
-        print("1 - 只显示最终结果")
-        print("2 - 显示详细处理过程")
-        
-        choice = input("请输入选择 (1 或 2, 默认为1): ").strip()
-        
-        if choice == "2":
+        # 根据参数选择显示模式
+        if args.mode == "detailed":
             print("Displaying detailed results...")
             display_detailed_results(processed_data, segmented_data)
         else:
             print("Displaying final result only...")
             display_final_result_only(processed_data, segmented_data)
         
-    except Exception as e:
-        print(f"Error during processing: {e}")
 
+        
+    except Exception as e:
+        print(f"处理过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+
+# 在文件末尾添加
 if __name__ == "__main__":
     main()
